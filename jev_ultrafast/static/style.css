@@ -735,3 +735,19 @@ textarea:focus-visible {
 }
 
 .operation-choices{display:flex;flex-wrap:wrap;gap:6px;margin:14px 0}.operation-choice{font-size:10px;padding:5px 7px;border:1px solid #dbe2d4;border-radius:5px;color:#687260}.operation-choice.best{color:#185c3b;background:#eef6e5;border-color:#88ac79}
+
+#website-row { margin-bottom: 14px; }
+#website-row label { display: block; margin-bottom: 8px; font-size: 13px; }
+#website { width: 100%; padding: 12px; box-sizing: border-box; }
+
+#chat-messages { display: flex; flex-direction: column; gap: 14px; margin: 24px 0; }
+.chat-message { max-width: 86%; padding: 16px 20px; border-radius: 16px; background: oklch(96% 0.01 160); line-height: 1.9; overflow-wrap: anywhere; }
+.chat-message.user { align-self: flex-end; background: oklch(92% 0.04 160); }
+.chat-message.assistant { align-self: flex-start; }
+.chat-message small { display: block; font-weight: 600; opacity: .65; }
+.chat-message div { white-space: pre-wrap; }
+
+.chat-navigation { display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin-top:24px; }
+.chat-navigation select { flex:1; min-width:140px; max-width:500px; padding:10px; }
+
+.performance { font-size:12px; opacity:.7; margin:12px 0; }

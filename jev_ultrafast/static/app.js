@@ -2,13 +2,9 @@ const $ = (id) => document.getElementById(id);
 const token = document.querySelector('meta[name="demo-token"]').content;
 let state = null,
   busy = false,
+  remoteBusy = false,
+  resumeAfterReport = false,
   automatic = false;
-const goals = {
-  flights: 'Find one-way flights from Zurich to London on September 20, 2026, for one adult in economy. Stop when matching flight options are visible. Do not select or book a flight.',
-  travel: 'Find a Design stay in Lisbon with Free cancellation and open Casa Flora.',
-  research:
-    "Open the article about using finite choices to control browser agents.",
-};
 const escape = (value) =>
   String(value ?? "").replace(
     /[&<>"']/g,
@@ -22,22 +18,34 @@ async function call(name, body = {}) {
   const response = await fetch(`/api/${name}`, {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-Demo-Token": token },
-    body: JSON.stringify(body),
+    body: JSON.stringify({ ...body, chat_id: state?.chat_id }),
   });
   const data = await response.json();
-  if (!response.ok) throw Error(data.error || "Request failed");
+  if (data.code === "stale_session") {
+    automatic = false;
+    sessionStorage.setItem("jev-task-draft", JSON.stringify({
+      goal: $("goal").value,
+    }));
+    location.reload();
+    throw Error("Refreshing connection. Press Start task when the page reloads.");
+  }
+  if (!response.ok) {
+    if (data.state) { state = data.state; render(); }
+    throw Error(data.error || "درخواست ناموفق بود؛ وضعیت اتصال را بررسی کن.");
+  }
   state = data;
   render();
   return data;
 }
 function controls() {
   const live = state?.page && !["done", "blocked"].includes(state.status);
-  $("start").disabled = busy;
-  $("scenario").disabled = busy;
+  $("start").disabled = busy || remoteBusy;
+  $("new-chat").disabled = busy || remoteBusy;
+  $("chat-list").disabled = busy || remoteBusy;
   $("goal").disabled = busy;
-  $("choose").disabled = busy || !live;
-  $("execute").disabled = busy || !state?.decision || !live;
-  $("auto").disabled = busy || !live;
+  $("choose").disabled = busy || remoteBusy || !live;
+  $("execute").disabled = busy || remoteBusy || !state?.decision || !live;
+  $("auto").disabled = busy || remoteBusy || !live;
   $("auto").hidden = automatic;
   $("stop").hidden = !automatic;
   $("download").disabled = !state?.history?.length;
@@ -68,6 +76,15 @@ async function perform(fn, label) {
 }
 function render() {
   if (!state) return;
+  $("performance").textContent = Object.entries(state.performance || {}).map(([name, m]) =>
+    `${name.includes("jev") ? "Jev" : "LLM"}: ${m.calls} فراخوانی · میانگین ${(m.mean_ms / 1000).toFixed(2)} ثانیه · خطا ${m.failures}`
+  ).join(" | ");
+  $("chat-list").innerHTML = (state.chats || []).map(c =>
+    `<option value="${escape(c.id)}">${escape(c.title)}</option>`).join("");
+  $("chat-list").value = state.chat_id;
+  $("chat-messages").innerHTML = (state.messages || []).map(m =>
+    `<article class="chat-message ${m.role === 'user' ? 'user' : 'assistant'}" dir="auto"><small>${m.role === 'user' ? 'شما' : m.source === 'harness' ? 'گزارش اجرا' : 'DeepSeek'}</small><div>${escape(m.content)}</div></article>`
+  ).join("");
   $("helper").textContent = `Text helper · ${state.text_model}`;
   $("plan").innerHTML = (state.plan || [])
     .map(
@@ -88,6 +105,15 @@ function render() {
   };
   $("status").textContent = labels[state.status] || state.status;
   if (!page) {
+    $("empty").hidden = false;
+    $("screenshot").hidden = true;
+    $("screenshot").removeAttribute("src");
+    $("targets").innerHTML = "";
+    $("choices").innerHTML = "";
+    $("operation-choices").innerHTML = "";
+    $("choice-title").textContent = "منتظر درخواست";
+    $("url").textContent = "مرورگر این گفتگو";
+    $("page-title").textContent = "هنوز صفحه‌ای باز نشده";
     controls();
     return;
   }
@@ -148,14 +174,17 @@ function render() {
 $("task-form").addEventListener("submit", (event) => {
   event.preventDefault();
   automatic = false;
+  resumeAfterReport = true;
   perform(
-    () =>
-      call("reset", { scenario: $("scenario").value, goal: $("goal").value }),
-    "Opening a fresh browser…",
-  );
-});
-$("scenario").addEventListener("change", () => {
-  $("goal").value = goals[$("scenario").value];
+    async () => {
+      await call("chat", { message: $("goal").value });
+      $("goal").value = "";
+    },
+    "در حال فهم درخواست و آماده‌کردن جست‌وجو…",
+  ).then(() => {
+    if (!$("error").hidden || !state?.start_run) return;
+    $("auto").click();
+  });
 });
 $("choose").addEventListener("click", () =>
   perform(() => call("predict"), "Jev is comparing the actions…"),
@@ -169,6 +198,7 @@ $("execute").addEventListener("click", () =>
 $("auto").addEventListener("click", () =>
   perform(async () => {
     automatic = true;
+    resumeAfterReport = true;
     controls();
     for (let i = 0; i < state.max_steps * 2 && automatic; i++) {
       $("status").textContent = "Running…";
@@ -183,10 +213,12 @@ $("auto").addEventListener("click", () =>
       if (["done", "blocked"].includes(state.status)) break;
     }
     automatic = false;
+    await call("summary");
   }, "Running the browser…"),
 );
 $("stop").addEventListener("click", () => {
   automatic = false;
+  resumeAfterReport = false;
   $("status").textContent = "Pausing after the current request…";
   controls();
 });
@@ -242,3 +274,56 @@ fetch("/api/state")
   .catch(() => {
     $("status").textContent = "Cannot reach local demo server";
   });
+
+try {
+  const draft = JSON.parse(sessionStorage.getItem("jev-task-draft") || "null");
+  if (draft) {
+    $("goal").value = draft.goal;
+    sessionStorage.removeItem("jev-task-draft");
+    $("error").textContent = "Connection refreshed. Press Start task to run your saved request.";
+    $("error").hidden = false;
+  }
+} catch { /* Ignore unavailable storage or invalid drafts. */ }
+
+let checkingReply = false;
+setInterval(async () => {
+  const waitingForRecovery = resumeAfterReport && state?.status === "ready";
+  if (busy || checkingReply || (!state?.messages?.some(m => m.pending) && !waitingForRecovery)) return;
+  checkingReply = true;
+  try {
+    const fresh = await fetch("/api/state").then(r => r.json());
+    if (!busy) {
+      state = fresh;
+      remoteBusy = Boolean(fresh.busy);
+      render();
+      if (resumeAfterReport && !remoteBusy && state.status === "ready" && !state.messages.some(m => m.pending)) {
+        $("auto").click();
+      }
+    }
+  } catch { /* Keep the current page; retry this read on the next poll. */ }
+  finally { checkingReply = false; }
+}, 750);
+
+let checkingActivity = false;
+setInterval(async () => {
+  if (busy || checkingActivity) return;
+  checkingActivity = true;
+  try {
+    const activity = await fetch("/api/activity").then(r => r.json());
+    remoteBusy = activity.busy;
+    controls();
+  } catch { /* Keep the last known state. */ }
+  finally { checkingActivity = false; }
+}, 750);
+
+async function selectChat(name, body = {}) {
+  automatic = false;
+  resumeAfterReport = false;
+  await perform(async () => {
+    await call(name, body);
+    $("goal").value = "";
+    $("goal").focus();
+  }, "در حال بازکردن گفتگو…");
+}
+$("new-chat").addEventListener("click", () => selectChat("new_chat"));
+$("chat-list").addEventListener("change", () => selectChat("switch_chat", {id: $("chat-list").value}));

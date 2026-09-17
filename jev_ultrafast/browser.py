@@ -2,7 +2,9 @@
 
 import hashlib
 import json
+import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -17,12 +19,31 @@ class StalePage(ValueError):
     """A decision no longer refers to the observed page."""
 
 
+def create_browser_tab():
+    if sys.platform != "darwin":
+        return cdp("Target.createTarget", url="about:blank", background=True)["targetId"]
+    # Chrome's user-enabled debugging can reject Target.createTarget on macOS.
+    # Open exactly one owned tab through Launch Services, then attach through CDP.
+    with tempfile.NamedTemporaryFile(suffix=".html", prefix="jev-tab-", mode="w") as page:
+        page.write("<!doctype html><title>Jev</title><p>Opening your task…</p>")
+        page.flush()
+        url = Path(page.name).resolve().as_uri()
+        subprocess.run(["open", "-a", "Google Chrome", url], check=True, timeout=5)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            for target in cdp("Target.getTargets")["targetInfos"]:
+                if target.get("type") == "page" and target.get("url") == url:
+                    return target["targetId"]
+            time.sleep(0.05)
+    raise RuntimeError("Chrome did not expose the new tab within 5 seconds. Check its debugging connection.")
+
+
 class Browser:
     def __init__(self, url):
         ensure_daemon()
-        self.target = cdp("Target.createTarget", url="about:blank", background=True)["targetId"]
+        self.target = create_browser_tab()
         self.session = cdp("Target.attachToTarget", targetId=self.target, flatten=True)["sessionId"]
-        self.call("Emulation.setDeviceMetricsOverride", width=1120, height=780, deviceScaleFactor=1, mobile=False)
+        self.call("Emulation.clearDeviceMetricsOverride")
         # Keep rAF/menus rendering in an owned background tab, without activating the user's Chrome tab.
         self.call("Emulation.setFocusEmulationEnabled", enabled=True)
         self.call("Page.navigate", url=url)
@@ -50,21 +71,25 @@ class Browser:
                     "Runtime.evaluate",
                     expression="""(action => new Promise(resolve => {
                       const field=window.__jevFast?.nodes.get(action.node);
-                      const autocomplete=action.kind==='fill' && field?.getAttribute('role')==='combobox';
+                      const autocomplete=action.kind==='fill' && action.autocomplete;
+                      const started=performance.now();
                       let frames=0, stopped=false;
                       const finish=()=>{stopped=true;resolve()};
-                      setTimeout(finish,autocomplete ? 200 : 50);
+                      setTimeout(finish,autocomplete ? 1200 : 50);
                       const ready=()=>{
                         if (stopped) return;
                         const ids=(field?.getAttribute('aria-controls')||field?.getAttribute('aria-owns')||'')
                           .split(/\\s+/).filter(Boolean);
                         const roots=ids.length ? ids.map(id=>document.getElementById(id)).filter(Boolean) : [document];
                         const options=roots.flatMap(root=>[...root.querySelectorAll('[role="option"]')]);
-                        if (++frames>=2 && (!autocomplete || options.some(e=>{
+                        const labels=options.map(e=>(e.textContent||'').replace(/\\s+/g,' ').trim());
+                        const changed=JSON.stringify(labels)!==JSON.stringify(action.suggestion_labels||[]);
+                        if (++frames>=2 && (!autocomplete || (changed && performance.now()-started>=150 &&
+                          options.some(e=>{
                           const r=e.getBoundingClientRect();
                           return r.width && r.height && r.bottom>0 && r.top<innerHeight &&
                             e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true});
-                        }))) finish();
+                        })))) finish();
                         else requestAnimationFrame(ready);
                       };
                       requestAnimationFrame(ready);
@@ -86,15 +111,20 @@ class Browser:
         raise StalePage("Page did not settle")
 
     def fresh(self, page, action=None):
-        if action is not None and action["kind"] in {"click", "select"}:
+        if action is not None and action["kind"] in {"scroll", "wait"}:
+            return self.evaluate("[performance.timeOrigin,location.href]") == page["page_key"][:2]
+        if action is not None and action["kind"] in {"click", "select", "fill"}:
             node = action["node"]
             if type(node) is not int:
                 return False
+            field_only = action["kind"] == "fill"
             current = self.evaluate(
-                "(() => { const c=window.__jevFast; "
-                f"return c ? [c.pageKey(),c.guard(c.nodes.get({node}))] : null; }})()"
+                "(() => { const c=window.__jevFast; if(!c) return null; const k=c.pageKey(); "
+                f"return [[k[0],k[1],k[6]],c.guard(c.nodes.get({node}),{str(field_only).lower()})]; }})()"
             )
-            return current == [page["page_key"], page["guards"].get(str(node))]
+            guards = page.get("field_guards", {}) if field_only else page["guards"]
+            key = page["page_key"]
+            return current == [[key[0], key[1], key[6]], guards.get(str(node))]
         return self.evaluate(MARKER) == page["marker"]
 
     def act(self, action, page, text=None):
@@ -108,7 +138,11 @@ class Browser:
 
     def close(self):
         if self.target:
-            cdp("Target.closeTarget", targetId=self.target)
+            try:
+                cdp("Target.closeTarget", targetId=self.target)
+            except RuntimeError as error:
+                if "No target with given id found" not in str(error):
+                    raise
             self.target = None
 
 
@@ -136,7 +170,9 @@ def browser_operation(request):
         action = request["action"]
         kind = action["kind"]
         if kind == "scroll":
-            call("Input.dispatchMouseEvent", type="mouseWheel", x=550, y=650, deltaX=0, deltaY=action["delta"])
+            size = evaluate("({w:innerWidth,h:innerHeight})")
+            call("Input.dispatchMouseEvent", type="mouseWheel", x=size["w"] * .5,
+                 y=size["h"] * .6, deltaX=0, deltaY=action["delta"])
         elif kind != "wait":
             if type(action["node"]) is not int:
                 raise ValueError("Invalid observed node")
@@ -146,9 +182,9 @@ def browser_operation(request):
               if (!e?.isConnected || e.matches(':disabled') || e.closest('[aria-disabled="true"],[inert]') ||
                   !e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true})) return null;
               if (action.kind==='fill' && (e.readOnly || e.getAttribute('aria-readonly')==='true')) return null;
-              const r=e.getBoundingClientRect(), x=r.x+r.width/2, y=r.y+r.height/2;
-              if (!r.width || !r.height || x<0 || y<0 || x>=innerWidth || y>=innerHeight) return null;
-              if (!e.contains(document.elementFromPoint(x,y))) return null;
+              const point=window.__jevFast.clickPoint(e);
+              if (!point) return null;
+              const {x,y}=point;
               if (action.kind==='select') {
                 if (e.tagName!=='SELECT' || ![...e.options].some(o=>o.value===action.value &&
                     !o.disabled && !o.closest('optgroup[disabled]'))) return null;

@@ -318,3 +318,109 @@ def test_navigation_during_prediction_reobserves_without_action(runner):
     assert runner.state["status"] == "ready"
     assert runner.state["decision"] is None
     runner.state["browser"].act.assert_not_called()
+
+
+def test_repeated_stale_decisions_stop_with_diagnostics(runner):
+    runner.state['browser'].fresh.side_effect = StalePage('Target covered')
+    for _ in range(3):
+        runner.command('tick')
+    assert runner.state['status'] == 'blocked'
+    assert runner.state['last_error'] == 'Target covered'
+    assert len(runner.state['diagnostics']) == 3
+    runner.state['browser'].act.assert_not_called()
+
+
+def test_continue_goal_keeps_existing_browser(runner):
+    browser = runner.state["browser"]
+    runner.browser = browser
+    runner.state['status'] = 'blocked'
+    runner.state['reported'] = True
+    runner.continue_goal('Use the information supplied in the follow-up')
+    assert runner.browser is browser
+    browser.close.assert_not_called()
+    assert runner.state['status'] == 'ready'
+    assert runner.state['goal'] == 'Use the information supplied in the follow-up'
+    assert 'reported' not in runner.state
+
+
+def test_missing_field_blocks_without_typing_and_preserves_evidence(runner, monkeypatch):
+    monkeypatch.setattr(loop, 'field_text', Mock(side_effect=model.MissingFieldValue('Missing; nothing typed')))
+    runner.state['user_message'] = 'Search for a book'
+    with pytest.raises(model.MissingFieldValue):
+        runner.command('act', {'fingerprint': runner.state['page']['fingerprint']})
+    runner.state['browser'].act.assert_not_called()
+    assert runner.state['status'] == 'blocked'
+    assert 'Search' in runner.state['input_question']
+    assert runner.state['diagnostics'][-1]['event'] == 'missing_field_value'
+
+
+def test_empty_choice_list_is_reported_as_invalid_field(monkeypatch):
+    monkeypatch.setenv('TEXT_MODEL_API_KEY', 'test')
+    monkeypatch.setattr(model, 'post_json', Mock(return_value={'choices': []}))
+    with pytest.raises(ValueError, match='nothing typed'):
+        model.field_text({'goal': 'Find a book'})
+
+
+def test_pending_autocomplete_cannot_skip_to_next_field_or_submit(monkeypatch):
+    p = page()
+    p['actions'].append({'id': 'suggestion', 'node': 40, 'kind': 'click', 'role': 'option', 'label': 'Tehran'})
+    p['interaction'] = {'kind': 'autocomplete', 'selection_pending': True, 'field_node': 10,
+                        'option_nodes': [40], 'query': 'Teh'}
+    def post(url, key, body):
+        questions = body['questions']
+        assert 'DONE' not in questions['operation']['criteria']
+        click = questions['click_target']['criteria']
+        assert len(click) == 1
+        assert next(iter(click.values()))['element'].endswith('Tehran')
+        target = next(iter(click))
+        return {'model': 'test', 'answers': {
+            'operation': choice(questions['operation']['criteria'], 'CLICK'),
+            'click_target': choice(click, target)}}
+    monkeypatch.setenv('TYPESAFE_API_KEY', 'test')
+    monkeypatch.setattr(model, 'post_json', post)
+    assert model.choose(p, 'Select Tehran then search', [])['choice'] == 'suggestion'
+
+
+def test_detects_navigation_cycle_despite_changing_pages():
+    pair = [{'kind': 'click', 'action': 'Destination', 'url': '/search', 'page_changed': True},
+            {'kind': 'click', 'action': 'Back', 'url': '/ride', 'page_changed': True}]
+    assert loop.repeated_cycle(pair * 3)
+    assert not loop.repeated_cycle(pair * 2)
+    assert not loop.repeated_cycle([{'kind': 'scroll', 'action': 'Down', 'url': '/results'}] * 6)
+
+
+def test_terminal_stop_observes_latest_page_without_dom_target_guard(runner):
+    runner.state['decision'] = decision('BLOCKED')
+    runner.command('act', {'fingerprint': runner.state['page']['fingerprint']})
+    runner.state['browser'].fresh.assert_called_once_with(runner.state['page'], {'kind': 'wait'})
+    runner.state['browser'].observe.assert_called_once()
+    runner.state['browser'].act.assert_not_called()
+    assert runner.state['status'] == 'blocked'
+
+
+def test_app_shell_is_reobserved_before_model_decision(runner, monkeypatch):
+    shell = {**page(), 'text': 'v18.44.1', 'actions': [{'id': 'wait', 'kind': 'wait', 'label': 'Wait'}]}
+    runner.state['page'] = shell
+    runner.state['status'] = 'ready'
+    loaded = page()
+    runner.state['browser'].observe.return_value = loaded
+    monkeypatch.setattr(loop.time, 'sleep', lambda _: None)
+    choose = Mock(return_value=decision())
+    monkeypatch.setattr(loop, 'choose', choose)
+    runner.command('predict')
+    assert choose.call_args.args[0] == loaded
+    assert runner.state['diagnostics'][-1]['controls_ready'] is True
+    runner.state['browser'].act.assert_not_called()
+
+
+def test_app_shell_wait_is_bounded(runner, monkeypatch):
+    shell = {**page(), 'text': 'v18.44.1', 'actions': []}
+    runner.state['page'] = shell
+    runner.state['status'] = 'ready'
+    runner.state['browser'].observe.return_value = shell
+    monkeypatch.setattr(loop.time, 'sleep', lambda _: None)
+    clock = iter([10, 11, 20, 21])
+    monkeypatch.setattr(loop.time, 'perf_counter', lambda: next(clock))
+    monkeypatch.setattr(loop, 'choose', Mock(return_value=decision('BLOCKED')))
+    runner.command('predict')
+    assert runner.state['diagnostics'][-1] == {'event': 'app_shell_wait', 'polls': 1, 'controls_ready': False}

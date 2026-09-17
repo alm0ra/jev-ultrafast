@@ -136,3 +136,31 @@ Tests are offline. `uv run python scripts/check_guards.py` checks real controls 
 ---
 
 [Browser Use](https://github.com/browser-use/browser-use) · [Browser Harness](https://github.com/browser-use/browser-harness) · [TypeSafe speculative fan-out](https://docs.typesafe.ai/patterns/fan-out)
+
+## Local custom-task mode
+
+Enter a task in English or Persian and click **ارسال**. The text model prepares a web search query, then Jev selects from actual search
+results and operates observed page controls. Model-generated domains are never
+used as starting URLs. No URL
+or scenario selection is required. **Pause** stops after the current request.
+
+Both API keys are needed for website selection and generated field text. Completion
+still requires inspecting the actual page; arbitrary-site success is not guaranteed.
+The API retains explicit URLs and fixture scenarios for testing.
+
+The local UI is a chat. DeepSeek routes conversational questions to a direct reply,
+and browser tasks to Jev. On completion, blockage or execution errors, DeepSeek
+summarizes the observed page and action history. This explanation is not an
+independent guarantee of task success. Conversation history stays in server memory
+until restart. Browser recovery and replanning remain limited.
+
+Result explanations run in a background thread over a copied snapshot. They never
+hold the browser execution lock during the model call; the UI polls for completion.
+Task interpretation and search-query preparation share one LLM request. Jev selects clicks,
+selection and scrolling. A background LLM progress review runs every five actions;
+outdated advice is discarded. TYPE_TEXT still waits for a required generated
+value; this data dependency is not hidden as parallel execution.
+
+The UI shows actual per-model HTTP call counts, failures and average latency since
+server start. These timings include network/provider time, not full-task latency.
+Control replies use concise goals and ask one question at a time when input is missing.
